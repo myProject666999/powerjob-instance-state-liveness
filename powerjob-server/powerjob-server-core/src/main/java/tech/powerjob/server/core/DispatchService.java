@@ -31,7 +31,9 @@ import tech.powerjob.server.remote.worker.selector.TaskTrackerSelectorService;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 import static tech.powerjob.common.enums.InstanceStatus.*;
@@ -62,12 +64,36 @@ public class DispatchService {
     private final TaskTrackerSelectorService taskTrackerSelectorService;
 
     /**
+     * 一次性排除的 Worker 地址（instanceId -> workerAddress），仅对下一次派发生效，派发后即移除
+     */
+    private final Map<Long, String> oneShotExcludedWorkerAddress = new ConcurrentHashMap<>();
+
+    /**
      * 异步重新派发
      *
      * @param instanceId 实例 ID
      */
     @UseCacheLock(type = "processJobInstance", key = "#instanceId", concurrencyLevel = 1024)
     public void redispatchAsync(Long instanceId, int originStatus) {
+        // 将状态重置为等待派发
+        instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(instanceId, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
+    }
+
+    /**
+     * 异步重新派发（本次派发排除指定 Worker 一次）。
+     * 用于实例失联后的重派：本次派发排除原 TaskTracker 所在 Worker，避免任务立刻落回
+     * 可能仍存活的旧 TaskTracker 造成重复执行；排除仅生效一次，后续派发自动恢复该 Worker 的候选资格，不永久屏蔽。
+     *
+     * @param instanceId             实例 ID
+     * @param originStatus           原始状态
+     * @param excludedWorkerAddress  本次派发需要排除的 Worker 地址（原 TaskTracker 地址）
+     */
+    @UseCacheLock(type = "processJobInstance", key = "#instanceId", concurrencyLevel = 1024)
+    public void redispatchAsyncExcludingWorker(Long instanceId, int originStatus, String excludedWorkerAddress) {
+        // 先记录排除地址，再重置状态，避免状态翻转后派发立刻发生导致排除失效
+        if (StringUtils.isNotEmpty(excludedWorkerAddress)) {
+            oneShotExcludedWorkerAddress.put(instanceId, excludedWorkerAddress);
+        }
         // 将状态重置为等待派发
         instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(instanceId, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
     }
@@ -156,6 +182,17 @@ public class DispatchService {
 
             instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), FAILED, SystemInstanceResult.NO_WORKER_AVAILABLE);
             return;
+        }
+        // 一次性排除：失联重派的实例，本次派发排除原 Worker（仅生效一次，后续派发自动恢复候选）
+        final String excludedWorkerAddress = oneShotExcludedWorkerAddress.remove(instanceId);
+        if (excludedWorkerAddress != null) {
+            suitableWorkers = suitableWorkers.stream().filter(w -> !excludedWorkerAddress.equals(w.getAddress())).collect(Collectors.toList());
+            if (suitableWorkers.isEmpty()) {
+                // 排除后无候选 Worker：本轮放弃派发，实例保持等待派发，下轮调度自动恢复该 Worker 的候选资格
+                log.warn("[Dispatcher-{}|{}] cancel dispatch because no worker remains after excluding the previous worker {}", jobId, instanceId, excludedWorkerAddress);
+                return;
+            }
+            log.info("[Dispatcher-{}|{}] exclude the previous worker {} for this dispatch.", jobId, instanceId, excludedWorkerAddress);
         }
         // 判断是否超载，在所有可用 worker 超载的情况下直接跳过当前任务
         suitableWorkers = filterOverloadWorker(suitableWorkers);

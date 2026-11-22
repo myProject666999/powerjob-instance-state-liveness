@@ -22,13 +22,19 @@ public class TimezoneTest {
 
         System.out.println("timestamp before GMT: " + System.currentTimeMillis());
 
-        TimeZone.setDefault(TimeZone.getTimeZone("GMT"));
-        TimeZone timeZone = TimeZone.getDefault();
-        System.out.println(timeZone.getDisplayName());
-        System.out.println(new Date());
-        System.out.println(DateFormatUtils.format(new Date(), OmsConstant.TIME_PATTERN));
+        // 保存并恢复默认时区，避免污染同 JVM 中其他时间敏感测试
+        TimeZone original = TimeZone.getDefault();
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("GMT"));
+            TimeZone timeZone = TimeZone.getDefault();
+            System.out.println(timeZone.getDisplayName());
+            System.out.println(new Date());
+            System.out.println(DateFormatUtils.format(new Date(), OmsConstant.TIME_PATTERN));
 
-        System.out.println("timestamp after GMT: " + System.currentTimeMillis());
+            System.out.println("timestamp after GMT: " + System.currentTimeMillis());
+        } finally {
+            TimeZone.setDefault(original);
+        }
     }
 
 }

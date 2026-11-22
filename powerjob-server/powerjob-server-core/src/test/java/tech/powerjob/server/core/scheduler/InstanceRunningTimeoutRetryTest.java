@@ -20,6 +20,7 @@ import tech.powerjob.server.persistence.remote.model.brief.BriefInstanceInfo;
 import tech.powerjob.server.persistence.remote.repository.*;
 import tech.powerjob.server.remote.transporter.ProtocolInfo;
 import tech.powerjob.server.remote.transporter.TransportService;
+import tech.powerjob.server.remote.worker.WorkerClusterQueryService;
 
 import java.util.Collections;
 import java.util.Date;
@@ -35,6 +36,7 @@ class InstanceRunningTimeoutRetryTest {
     private final AppInfoRepository apps = mock(AppInfoRepository.class);
     private final TransportService transport = mock(TransportService.class);
     private final InstanceManager completion = mock(InstanceManager.class);
+    private final WorkerClusterQueryService workers = mock(WorkerClusterQueryService.class);
     private InstanceStatusCheckService checker;
     private InstanceInfoDO instance;
     private JobInfoDO job;
@@ -45,11 +47,14 @@ class InstanceRunningTimeoutRetryTest {
         protocol.setAddress("fixture-server:10010");
         when(transport.defaultProtocol()).thenReturn(protocol);
         when(apps.listAppIdByCurrentServer(protocol.getAddress())).thenReturn(Collections.singletonList(10L));
+        // No WorkerInfo -> heartbeat timeout, the checker must skip probing and use the worker-lost path.
+        when(workers.getWorkerInfoByAddress(any(), any())).thenReturn(Optional.empty());
         // Real redispatch code exercises the conditional state transition, not just a mocked call.
         DispatchService dispatch = new DispatchService(transport, null, completion, null, instances, null);
         checker = new InstanceStatusCheckService(transport, dispatch, completion,
                 mock(WorkflowInstanceManager.class), apps, jobs, instances,
-                mock(WorkflowInfoRepository.class), mock(WorkflowInstanceInfoRepository.class));
+                mock(WorkflowInfoRepository.class), mock(WorkflowInstanceInfoRepository.class),
+                workers, new InstanceLivenessProperties());
         instance = new InstanceInfoDO();
         instance.setId(20L); instance.setAppId(10L); instance.setJobId(30L); instance.setInstanceId(40L);
         instance.setStatus(InstanceStatus.RUNNING.getV());
@@ -67,6 +72,8 @@ class InstanceRunningTimeoutRetryTest {
                     instance.setGmtModified(call.getArgument(3));
                     return 1;
                 });
+        when(instances.update4FailByInstanceIdAndOriginStatus(eq(40L), eq(InstanceStatus.RUNNING.getV()),
+                eq(InstanceStatus.FAILED.getV()), anyString(), anyLong(), any())).thenReturn(1);
     }
 
     private void reportTimedOutInstance() {
@@ -93,10 +100,11 @@ class InstanceRunningTimeoutRetryTest {
         if (shouldRetry) {
             assertEquals(InstanceStatus.WAITING_DISPATCH.getV(), instance.getStatus());
             assertNull(instance.getFinishedTime());
-            verify(instances, never()).saveAndFlush(any());
+            verify(instances, never()).update4FailByInstanceIdAndOriginStatus(anyLong(), anyInt(), anyInt(), anyString(), anyLong(), any());
             verify(completion, never()).processFinishedInstance(anyLong(), any(), any(), any());
         } else {
-            assertTimedOutFailure();
+            // worker heartbeat is gone -> the dedicated worker-lost message is used
+            assertTimedOutFailure(SystemInstanceResult.WORKER_LOST);
         }
     }
 
@@ -105,7 +113,7 @@ class InstanceRunningTimeoutRetryTest {
     void inactiveJobsStillCannotRetry(SwitchableStatus state) {
         job.setStatus(state.getV()); job.setInstanceRetryNum(2);
         reportTimedOutInstance();
-        assertTimedOutFailure();
+        assertTimedOutFailure(SystemInstanceResult.REPORT_TIMEOUT);
     }
 
     @ParameterizedTest
@@ -113,7 +121,7 @@ class InstanceRunningTimeoutRetryTest {
     void frequentJobsStillUseTheirOwnRecovery(TimeExpressionType type) {
         job.setTimeExpressionType(type.getV()); job.setInstanceRetryNum(2);
         reportTimedOutInstance();
-        assertTimedOutFailure();
+        assertTimedOutFailure(SystemInstanceResult.REPORT_TIMEOUT);
     }
 
     @Test
@@ -134,12 +142,13 @@ class InstanceRunningTimeoutRetryTest {
                 eq(InstanceStatus.RUNNING.getV()), eq(40L), eq(InstanceStatus.WAITING_WORKER_RECEIVE.getV()));
     }
 
-    private void assertTimedOutFailure() {
+    private void assertTimedOutFailure(String expectedResult) {
         assertEquals(InstanceStatus.FAILED.getV(), instance.getStatus());
-        assertEquals(SystemInstanceResult.REPORT_TIMEOUT, instance.getResult());
+        assertEquals(expectedResult, instance.getResult());
         assertNotNull(instance.getFinishedTime());
-        verify(instances).saveAndFlush(same(instance));
+        verify(instances).update4FailByInstanceIdAndOriginStatus(eq(40L), eq(InstanceStatus.RUNNING.getV()),
+                eq(InstanceStatus.FAILED.getV()), eq(expectedResult), anyLong(), any());
         verify(instances, never()).updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(anyLong(), anyInt(), anyInt(), any());
-        verify(completion).processFinishedInstance(40L, null, InstanceStatus.FAILED, SystemInstanceResult.REPORT_TIMEOUT);
+        verify(completion).processFinishedInstance(40L, null, InstanceStatus.FAILED, expectedResult);
     }
 }

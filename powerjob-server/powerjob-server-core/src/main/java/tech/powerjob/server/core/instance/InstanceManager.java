@@ -105,14 +105,14 @@ public class InstanceManager implements TransportServiceAware {
 
         InstanceStatus receivedInstanceStatus = InstanceStatus.of(req.getInstanceStatus());
         Integer timeExpressionType = jobInfo.getTimeExpressionType();
-        // 更新 最后上报时间 和 修改时间
-        instanceInfo.setLastReportTime(req.getReportTime());
-        instanceInfo.setGmtModified(new Date());
 
         // FREQUENT 任务没有失败重试机制，TaskTracker一直运行即可，只需要将存活信息同步到DB即可
         // FREQUENT 任务的 newStatus 只有2中情况，一种是 RUNNING，一种是 FAILED（表示该机器 overload，需要重新选一台机器执行）
         // 综上，直接把 status 和 runningNum 同步到DB即可
         if (TimeExpressionType.FREQUENT_TYPES.contains(timeExpressionType)) {
+            // 更新 最后上报时间 和 修改时间
+            instanceInfo.setLastReportTime(req.getReportTime());
+            instanceInfo.setGmtModified(new Date());
             // 如果实例处于失败状态，则说明该 worker 失联了一段时间，被 server 判定为宕机，而此时该秒级任务有可能已经重新派发了，故需要 Kill 掉该实例
             // fix issue 375
             if (instanceInfo.getStatus() == InstanceStatus.FAILED.getV()) {
@@ -138,21 +138,43 @@ public class InstanceManager implements TransportServiceAware {
             }
             return;
         }
-        // 更新运行次数
-        if (instanceInfo.getStatus() == InstanceStatus.WAITING_WORKER_RECEIVE.getV()) {
+
+        // **************** 普通任务：由状态迁移表统一决策 ****************
+        InstanceStatus currentStatus = InstanceStatus.of(instanceInfo.getStatus());
+        final InstanceStatusTransition.Action action = InstanceStatusTransition.decide(currentStatus, receivedInstanceStatus);
+        switch (action) {
+            case IGNORE_ON_TERMINAL:
+                // 终态（失败/成功/取消/手动停止）不可改写：晚到回报只记录日志，不重复触发完成、告警或工作流推进
+                log.warn("[InstanceManager-{}] instance is already in terminal status {}, drop the late report: {}", instanceId, currentStatus, req);
+                return;
+            case STOP_STRAY_TRACKER:
+                // 终态下旧 TaskTracker 仍上报运行中：上报来源已核对为当前记录的 TaskTracker 地址，
+                // 通知其停止（与秒级任务失联恢复共用同一处理），停止请求只发往该地址
+                log.warn("[InstanceManager-{}] instance is already in terminal status {}, but the original TaskTracker still reports RUNNING, notify it to stop. report: {}", instanceId, currentStatus, req);
+                stopInstance(instanceId, instanceInfo);
+                return;
+            case IGNORE:
+                log.warn("[InstanceManager-{}] ignore the meaningless status report, currentStatus: {}, report: {}", instanceId, currentStatus, req);
+                return;
+            default:
+                break;
+        }
+
+        // 更新 最后上报时间 和 修改时间
+        instanceInfo.setLastReportTime(req.getReportTime());
+        instanceInfo.setGmtModified(new Date());
+
+        // 更新运行次数：仅「等待Worker接收」的首次有效上报计一次（其中 -> 运行中 是唯一的非终态递增迁移）
+        if (InstanceStatusTransition.countsAttempt(currentStatus, receivedInstanceStatus)) {
             // 这里不会存在并发问题
             instanceInfo.setRunningTimes(instanceInfo.getRunningTimes() + 1);
         }
-        // QAQ ，不能提前变更 status，否则会导致更新运行次数的逻辑不生效继而导致普通任务 无限重试
-        instanceInfo.setStatus(receivedInstanceStatus.getV());
 
-        boolean finished = false;
-        if (receivedInstanceStatus == InstanceStatus.SUCCEED) {
-            instanceInfo.setResult(req.getResult());
-            instanceInfo.setFinishedTime(req.getEndTime() == null ? System.currentTimeMillis() : req.getEndTime());
-            finished = true;
-        } else if (receivedInstanceStatus == InstanceStatus.FAILED) {
-
+        // 终态上报（成功，或重试预算耗尽的失败）：条件写入终态，保证并发场景下收尾只触发一次
+        InstanceStatus finalStatus = null;
+        if (action == InstanceStatusTransition.Action.FINISH) {
+            finalStatus = receivedInstanceStatus;
+        } else if (action == InstanceStatusTransition.Action.RETRY_OR_FINISH) {
             // 当前重试次数 <= 最大重试次数，进行重试 （第一次运行，runningTimes为1，重试一次，instanceRetryNum也为1，故需要 =）
             if (instanceInfo.getRunningTimes() <= jobInfo.getInstanceRetryNum()) {
 
@@ -165,18 +187,27 @@ public class InstanceManager implements TransportServiceAware {
                 // 问题：会丢失以往的调度记录（actualTriggerTime什么的都会被覆盖）
                 instanceInfo.setStatus(InstanceStatus.WAITING_DISPATCH.getV());
             } else {
-                instanceInfo.setResult(req.getResult());
-                instanceInfo.setFinishedTime(req.getEndTime() == null ? System.currentTimeMillis() : req.getEndTime());
-                finished = true;
+                finalStatus = InstanceStatus.FAILED;
                 log.info("[InstanceManager-{}] instance execute failed and have no chance to retry.", instanceId);
             }
         }
-        if (finished) {
-            // 最终状态允许直接覆盖更新
-            instanceInfoRepository.saveAndFlush(instanceInfo);
+        if (finalStatus != null) {
+            instanceInfo.setStatus(finalStatus.getV());
+            instanceInfo.setResult(req.getResult());
+            instanceInfo.setFinishedTime(req.getEndTime() == null ? System.currentTimeMillis() : req.getEndTime());
+            // 终态写入使用条件更新：并发（如与手动停止竞争）时只有一个写入者成功，败者只记录日志
+            final int updated = instanceInfoRepository.update4FinishByInstanceIdAndStatus(instanceInfo.getLastReportTime(), instanceInfo.getGmtModified(), instanceInfo.getRunningTimes(), instanceInfo.getStatus(), instanceInfo.getResult(), instanceInfo.getFinishedTime(), instanceInfo.getInstanceId(), originStatus);
+            if (updated == 0) {
+                log.warn("[InstanceManager-{}] finish instance({}) failed, maybe the instance status has been changed to terminal by other thread. discard this finish.", instanceId, finalStatus);
+                return;
+            }
             // 这里的 InstanceStatus 只有 成功/失败 两种，手动停止不会由 TaskTracker 上报
-            processFinishedInstance(instanceId, req.getWfInstanceId(), receivedInstanceStatus, req.getResult());
+            processFinishedInstance(instanceId, req.getWfInstanceId(), finalStatus, req.getResult());
             return;
+        }
+        // APPLY：按上报状态推进（RETRY_OR_FINISH 的重试分支已在上面将状态置为 WAITING_DISPATCH）
+        if (action == InstanceStatusTransition.Action.APPLY) {
+            instanceInfo.setStatus(receivedInstanceStatus.getV());
         }
         // 带条件更新
         final int i = instanceInfoRepository.updateStatusChangeInfoByInstanceIdAndStatus(instanceInfo.getLastReportTime(), instanceInfo.getGmtModified(), instanceInfo.getRunningTimes(), instanceInfo.getStatus(), instanceInfo.getInstanceId(), originStatus);

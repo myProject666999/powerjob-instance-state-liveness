@@ -27,6 +27,11 @@ public class BriefInstanceInfo {
      */
     private Long runningTimes;
 
+    /**
+     * 当前 TaskTracker 地址（失联检查时用于定位 Worker）
+     */
+    private String taskTrackerAddress;
+
 
     public BriefInstanceInfo(Long appId, Long id, Long jobId, Long instanceId) {
         this.appId = appId;
@@ -41,5 +46,14 @@ public class BriefInstanceInfo {
         this.jobId = jobId;
         this.instanceId = instanceId;
         this.runningTimes = runningTimes;
+    }
+
+    public BriefInstanceInfo(Long appId, Long id, Long jobId, Long instanceId, Long runningTimes, String taskTrackerAddress) {
+        this.appId = appId;
+        this.id = id;
+        this.jobId = jobId;
+        this.instanceId = instanceId;
+        this.runningTimes = runningTimes;
+        this.taskTrackerAddress = taskTrackerAddress;
     }
 }

@@ -47,6 +47,56 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
     int updateStatusChangeInfoByInstanceIdAndStatus(@Param("lastReportTime") long lastReportTime, @Param("modifyTime") Date modifyTime, @Param("runningTimes") long runningTimes, @Param("status") int status, @Param("instanceId") long instanceId, @Param("oldStatus") int oldStatus);
 
     /**
+     * 条件写入终态（成功/失败）：仅当数据库当前状态仍为 oldStatus 时生效，
+     * 保证并发场景下终态只写入一次、收尾（日志/告警/工作流推进）只触发一次
+     *
+     * @param lastReportTime 最近一次上报时间
+     * @param modifyTime     更新时间
+     * @param runningTimes   运行次数
+     * @param status         目标终态
+     * @param result         执行结果
+     * @param finishedTime   完成时间
+     * @param instanceId     实例 ID
+     * @param oldStatus      旧状态
+     * @return 更新记录数，0 表示状态已被其他线程变更，本次终态写入被放弃
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @Query(value = "update InstanceInfoDO set lastReportTime = :lastReportTime, gmtModified = :modifyTime, runningTimes = :runningTimes, status = :status, result = :result, finishedTime = :finishedTime where instanceId = :instanceId and status = :oldStatus")
+    int update4FinishByInstanceIdAndStatus(@Param("lastReportTime") long lastReportTime, @Param("modifyTime") Date modifyTime, @Param("runningTimes") long runningTimes, @Param("status") int status, @Param("result") String result, @Param("finishedTime") long finishedTime, @Param("instanceId") long instanceId, @Param("oldStatus") int oldStatus);
+
+    /**
+     * 条件写入失败终态（失联检查/手动停止等系统侧终态共用）：
+     * 仅当数据库当前状态仍为 originStatus 时生效，终态竞争先到先得，后到者放弃
+     *
+     * @return 更新记录数，0 表示实例状态已被其他线程变更（如已被手动停止），本次失败化处理放弃
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @Query(value = "update InstanceInfoDO set status = :status, gmtModified = :modifyTime, finishedTime = :finishedTime, result = :result where instanceId = :instanceId and status = :originStatus")
+    int update4FailByInstanceIdAndOriginStatus(@Param("instanceId") long instanceId, @Param("originStatus") int originStatus, @Param("status") int status, @Param("result") String result, @Param("finishedTime") long finishedTime, @Param("modifyTime") Date modifyTime);
+
+    /**
+     * 条件写入手动停止终态：仅当数据库当前状态仍属于 originStatuses（广义运行状态）时生效
+     *
+     * @return 更新记录数，0 表示实例已进入终态，停止操作放弃
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @Query(value = "update InstanceInfoDO set status = :status, gmtModified = :modifyTime, finishedTime = :finishedTime, result = :result where instanceId = :instanceId and status in :originStatuses")
+    int update4StopByInstanceIdAndOriginStatusIn(@Param("instanceId") long instanceId, @Param("originStatuses") List<Integer> originStatuses, @Param("status") int status, @Param("result") String result, @Param("finishedTime") long finishedTime, @Param("modifyTime") Date modifyTime);
+
+    /**
+     * 探测确认实例仍在运行后，条件刷新上报时间（仅当实例仍处于 RUNNING 时生效）
+     *
+     * @return 更新记录数，0 表示实例状态已变更，放弃刷新
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @Query(value = "update InstanceInfoDO set lastReportTime = :lastReportTime, gmtModified = :modifyTime where instanceId = :instanceId and status = :status")
+    int refreshReportTimeByInstanceIdAndStatus(@Param("lastReportTime") long lastReportTime, @Param("modifyTime") Date modifyTime, @Param("instanceId") long instanceId, @Param("status") int status);
+
+    /**
      * 更新任务执行记录内容（DispatchService专用）
      *
      * @param instanceId         实例 ID
@@ -116,7 +166,7 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
     @Query(value = "select new tech.powerjob.server.persistence.remote.model.brief.BriefInstanceInfo(i.appId,i.id,i.jobId,i.instanceId) from InstanceInfoDO i where i.appId in (:appIds) and i.status = :status and i.actualTriggerTime < :time")
     List<BriefInstanceInfo> selectBriefInfoByAppIdInAndStatusAndActualTriggerTimeLessThan(@Param("appIds") List<Long> appIds, @Param("status") int status, @Param("time") long time, Pageable pageable);
 
-    @Query(value = "select new tech.powerjob.server.persistence.remote.model.brief.BriefInstanceInfo(i.appId,i.id,i.jobId,i.instanceId,i.runningTimes) from InstanceInfoDO i where i.appId in (:appIds) and i.status = :status and i.gmtModified < :time")
+    @Query(value = "select new tech.powerjob.server.persistence.remote.model.brief.BriefInstanceInfo(i.appId,i.id,i.jobId,i.instanceId,i.runningTimes,i.taskTrackerAddress) from InstanceInfoDO i where i.appId in (:appIds) and i.status = :status and i.gmtModified < :time")
     List<BriefInstanceInfo> selectBriefInfoByAppIdInAndStatusAndGmtModifiedBefore(@Param("appIds") List<Long> appIds, @Param("status") int status, @Param("time") Date time, Pageable pageable);
 
 

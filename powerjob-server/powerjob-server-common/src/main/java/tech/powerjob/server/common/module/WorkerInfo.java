@@ -72,8 +72,18 @@ public class WorkerInfo {
     }
 
     public boolean timeout() {
+        return timeout(WORKER_TIMEOUT_MS);
+    }
+
+    /**
+     * 按可配置阈值判断 worker 心跳是否超时
+     *
+     * @param timeoutMs 心跳超时阈值（毫秒）
+     * @return true 表示 worker 心跳超时（失联）
+     */
+    public boolean timeout(long timeoutMs) {
         long timeout = System.currentTimeMillis() - lastActiveTime;
-        return timeout > WORKER_TIMEOUT_MS;
+        return timeout > timeoutMs;
     }
 
     public boolean overload() {

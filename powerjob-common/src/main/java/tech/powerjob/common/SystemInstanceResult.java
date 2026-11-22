@@ -55,6 +55,10 @@ public class SystemInstanceResult {
      * TaskTracker 长时间未上报
      */
     public static final String REPORT_TIMEOUT = "worker report timeout, maybe TaskTracker down";
+    /**
+     * Worker 心跳超时（Worker 失联，区别于心跳正常但上报停滞的 REPORT_TIMEOUT）
+     */
+    public static final String WORKER_LOST = "worker heartbeat timeout, worker maybe down";
     public static final String CAN_NOT_FIND_JOB_INFO = "can't find job info";
 
     /* *********** workflow 专用 *********** */

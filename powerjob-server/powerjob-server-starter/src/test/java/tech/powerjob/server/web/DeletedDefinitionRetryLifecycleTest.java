@@ -10,6 +10,7 @@ import tech.powerjob.server.common.module.WorkerInfo;
 import tech.powerjob.server.core.DispatchService;
 import tech.powerjob.server.core.alarm.AlarmCenter;
 import tech.powerjob.server.core.instance.*;
+import tech.powerjob.server.core.scheduler.InstanceLivenessProperties;
 import tech.powerjob.server.core.scheduler.InstanceStatusCheckService;
 import tech.powerjob.server.core.scheduler.TimingStrategyService;
 import tech.powerjob.server.core.service.impl.job.JobServiceImpl;
@@ -58,6 +59,7 @@ class DeletedDefinitionRetryLifecycleTest {
         when(jobs.findByIdIn(any())).thenReturn(Collections.singletonList(job));
         when(metadata.fetchJobInfoByInstanceId(40L)).thenReturn(job);
         when(instances.updateStatusChangeInfoByInstanceIdAndStatus(anyLong(), any(), anyLong(), anyInt(), eq(40L), anyInt())).thenReturn(1);
+        when(instances.update4FinishByInstanceIdAndStatus(anyLong(), any(), anyLong(), anyInt(), any(), anyLong(), eq(40L), anyInt())).thenReturn(1);
 
         JobServiceImpl definitions = new JobServiceImpl(mock(InstanceService.class), dispatch, jobs, instances, mock(TimingStrategyService.class));
         definitions.deleteJob(30L);
@@ -83,7 +85,8 @@ class DeletedDefinitionRetryLifecycleTest {
                     .thenAnswer(call -> { instance.setStatus(call.getArgument(1)); instance.setTaskTrackerAddress(call.getArgument(3)); return 1; });
             InstanceStatusCheckService checker = new InstanceStatusCheckService(transport, dispatch, manager,
                     mock(WorkflowInstanceManager.class), apps, jobs, instances,
-                    mock(WorkflowInfoRepository.class), mock(WorkflowInstanceInfoRepository.class));
+                    mock(WorkflowInfoRepository.class), mock(WorkflowInstanceInfoRepository.class),
+                    workers, new InstanceLivenessProperties());
             checker.checkWaitingDispatchInstance();
             assertEquals(InstanceStatus.WAITING_WORKER_RECEIVE.getV(), instance.getStatus());
             ArgumentCaptor<ServerScheduleJobReq> request = ArgumentCaptor.forClass(ServerScheduleJobReq.class);
@@ -99,7 +102,7 @@ class DeletedDefinitionRetryLifecycleTest {
         assertEquals(finalStatus.getV(), instance.getStatus());
         assertNotNull(instance.getFinishedTime());
         assertEquals("fixture-result", instance.getResult());
-        verify(instances).saveAndFlush(instance);
+        verify(instances).update4FinishByInstanceIdAndStatus(anyLong(), any(), anyLong(), eq(finalStatus.getV()), eq("fixture-result"), anyLong(), eq(40L), anyInt());
         verify(manager).processFinishedInstance(40L, null, finalStatus, "fixture-result");
         assertEquals(SwitchableStatus.DELETED.getV(), job.getStatus(), "Retry must not revive the definition");
     }

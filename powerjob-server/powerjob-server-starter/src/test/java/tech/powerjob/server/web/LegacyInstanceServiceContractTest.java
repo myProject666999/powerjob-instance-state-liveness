@@ -36,6 +36,7 @@ class LegacyInstanceServiceContractTest {
         instance.setStatus("retry".equals(operation) ? InstanceStatus.FAILED.getV() : InstanceStatus.WAITING_DISPATCH.getV());
         instance.setExpectedTriggerTime(System.currentTimeMillis() + 3600000L); instance.setJobParams("private-parameters");
         when(instances.findByInstanceId(instance.getInstanceId())).thenReturn(instance);
+        when(instances.update4StopByInstanceIdAndOriginStatusIn(anyLong(), anyList(), anyInt(), anyString(), anyLong(), any())).thenReturn(1);
         when(jobs.findById(30L)).thenReturn(Optional.of(new JobInfoDO()));
         MockHttpServletRequest request = new MockHttpServletRequest(); request.addHeader("AppId", sameApp ? "20" : "21");
         QueryInstanceDetailRequest body = new QueryInstanceDetailRequest(); body.setInstanceId(instance.getInstanceId()); body.setAppId(20L);

@@ -137,12 +137,21 @@ public class InstanceService {
                 throw new IllegalArgumentException("can't stop finished instance!");
             }
 
-            // 更新数据库，将状态置为停止
+            /*
+            条件写入终态：与超时失败等并发终态写入竞争时先到先得（终态不可改写），
+            保证手动停止与超时失败不会互相覆盖，收尾（日志/告警/工作流推进）也只触发一次
+             */
+            long now = System.currentTimeMillis();
+            int updated = instanceInfoRepository.update4StopByInstanceIdAndOriginStatusIn(instanceId, InstanceStatus.GENERALIZED_RUNNING_STATUS, STOPPED.getV(), SystemInstanceResult.STOPPED_BY_USER, now, new Date(now));
+            if (updated == 0) {
+                log.warn("[Instance-{}] stop instance failed, the instance has been changed to terminal status by other thread.", instanceId);
+                throw new IllegalArgumentException("can't stop finished instance!");
+            }
+            // 同步内存中的实体状态
             instanceInfo.setStatus(STOPPED.getV());
-            instanceInfo.setGmtModified(new Date());
-            instanceInfo.setFinishedTime(System.currentTimeMillis());
+            instanceInfo.setGmtModified(new Date(now));
+            instanceInfo.setFinishedTime(now);
             instanceInfo.setResult(SystemInstanceResult.STOPPED_BY_USER);
-            instanceInfoRepository.saveAndFlush(instanceInfo);
 
             instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), STOPPED, SystemInstanceResult.STOPPED_BY_USER);
 
